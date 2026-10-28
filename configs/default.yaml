@@ -1,0 +1,138 @@
+# SymDiG research pipeline: every experiment of the proposal (E1-E7).
+# Any key can be overridden on the command line:  --set train.epochs=20 model.hidden=64
+
+paths:
+  data_root: dataset                  # the 4 NetFlow v2 CSV files (any sub-folder)
+  cache: cache                        # preprocessed arrays, splits, graph structures
+  results: results                    # job queue, run outputs, checkpoints, tables, figures
+  linegraph_repo: external/LineGraph  # git clone https://github.com/minhhieu-ph/LineGraph
+
+runtime:
+  threads: 2               # CPU threads per worker for torch / xgboost (launch.py sets this)
+  num_workers: 2           # DataLoader sampling workers per GPU job (launch.py sets this)
+
+data:
+  max_rows: null           # read only the first N rows (smoke tests)
+  in_memory: false         # false = memory-map (page cache shared by all workers; recommended)
+  group_classes: true      # CSE-CIC-IDS2018: 6 attack families + Benign
+  split_seed: 42           # fixed: every model and every model seed sees the same split
+  test_size: 0.25
+  val_frac: 0.1            # validation carved from the training part (model selection only)
+  val_max: 200000
+  ports: true              # append L4 port features (E4 also runs ports=false)
+
+protocols:
+  p2:                      # FeCoGraph protocol (TIFS 2025, Sec. V-A)
+    sample_frac: 0.02
+    label_frac: 0.3
+    val_frac: 0.1
+
+# shared backbone of the ablation ladder (E2/E3); NOT tuned per rung on purpose
+model:
+  arch: dual               # dual | hetero | dir | egsage
+  coupled: true            # sampler: shared edge set for both directions
+  force: true              # sampler: target edges always in the computation graph
+  fusion: mha              # concat | mha (arch=dual)
+  conv: gine               # gine | gatv2
+  hidden: 128
+  layers: 2
+  heads: 4
+  dropout: 0.2
+  ego: true                # ego-ID node feature on the target endpoints (Multi-GNN adaptation)
+  edge_updates: true       # edge MLP updates (Multi-GNN adaptation)
+
+sampler:
+  fanout: [20, 20]
+  tau_s: 0.0               # 0 = uniform neighbour sampling (as LinkNeighborLoader)
+  oversample: 4
+  max_hop_edges: 400000
+
+train:
+  epochs: 40
+  max_steps_per_epoch: 400 # random subset of training targets per epoch
+  batch_size: 4096
+  eval_batch_size: 8192
+  lr: 0.001
+  weight_decay: 0.0
+  grad_clip: 1.0
+  loss: wce                # ce | wce
+  loss_power: 0.5          # wce weight = (balanced weight) ** loss_power
+  patience: 6
+  amp: true                # bf16 autocast on A100
+  log_every: 20
+
+# rungs of the ablation ladder: each changes exactly one factor w.r.t. the previous one
+ladder:
+  0: {arch: hetero, coupled: false, force: false}   # Multi-GNN pipeline (LinkNeighborLoader + to_hetero mean)
+  1: {arch: hetero, coupled: false, force: true}    # + target edges always in the computation graph
+  2: {arch: hetero, coupled: true,  force: true}    # + coupled forward/reverse edge set
+  3: {arch: dual,   coupled: true,  force: true, fusion: concat}  # + decoupled streams, late concat
+  4: {arch: dual,   coupled: true,  force: true, fusion: mha}     # + attentive late fusion (SymDiG)
+
+# models compared in E4/E5 (graph models are tuned with Optuna before the final runs)
+models:
+  symdig:   {kind: gnn, model: {arch: dual, coupled: true, force: true, fusion: mha}}
+  multignn: {kind: gnn, model: {arch: hetero, coupled: false, force: false}}
+  multignn_fixed: {kind: gnn, model: {arch: hetero, coupled: true, force: true}}
+  dirgnn:   {kind: gnn, model: {arch: dir, coupled: true, force: true}}
+  egsage:   {kind: gnn, node_mode: ipport, model: {arch: egsage, coupled: true, force: true, ego: false, edge_updates: false}}
+  xgboost:  {kind: tabular}
+  rf:       {kind: tabular}
+  mlp:      {kind: tabular}
+  fecograph: {kind: fecograph}         # protocol p2 only
+
+# Multi-GNN's published AML hyper-parameters (E1 "as released" run)
+multignn_paper:
+  model: {conv: gine, hidden: 66, layers: 2, dropout: 0.01}
+  sampler: {fanout: [100, 100]}
+  train: {lr: 0.006, batch_size: 8192}
+
+tabular_defaults:
+  xgboost: {n_estimators: 2000, lr: 0.1, max_depth: 8, subsample: 0.8, colsample: 0.8, weight_power: 0.5}
+  rf: {n_estimators: 300, max_depth: 16, subsample: 0.8, colsample: 0.8, weight_power: 0.5}
+  mlp: {hidden: 256, layers: 3, dropout: 0.2, lr: 0.001, batch_size: 8192, epochs: 30, weight_power: 0.5}
+
+fecograph:                 # passed to LineGraph's train.py (paper defaults)
+  epochs: 2000
+  eval_every: 10
+  patience: 30
+  loss: supcon
+  lam: 0.5
+  tau: 0.3
+  max_clique: 100
+  k_sample: 10
+
+tuning:
+  trials: 30               # same budget for every model
+  gnn_epochs: 8            # shorter schedule inside a trial
+  gnn_steps: 150
+  datasets: [ton, unsw, ids2018, bot]   # tabular models: tuned on every dataset
+  gnn_datasets: [ton, unsw]             # GNNs: tuned on these; other datasets reuse the first one's params
+
+motif:
+  n_nodes: 4000
+  seed: 0
+  multiplicities: [1, 4, 16, 64, 256]
+
+experiments:
+  datasets: [ton, unsw, ids2018, bot]
+  seeds: [0, 1, 2, 3, 4]
+  seeds_large: [0, 1, 2]                  # used for bot (37.8M flows)
+  e1_fanouts: [[20, 20], [50, 50], [100, 100]]
+  e1_batches: 50
+  e3_seeds: [0, 1, 2]
+  e4_models: [xgboost, rf, mlp, egsage, dirgnn, multignn, multignn_fixed, symdig]
+  e4_p2_models: [xgboost, rf, symdig, egsage, fecograph]
+  e4_p2_datasets: [ton, bot, ids2018]
+  e5_models: [symdig, multignn, xgboost, mlp]
+  e5_transfer_models: [symdig, xgboost]
+  e6_datasets: [unsw, ids2018, ton]
+  e6_fracs: [0.02, 0.1, 0.5, 1.0]
+  e6_models: [symdig, multignn, egsage]
+  e6_profile_steps: 100
+  e6_mem_caps_gb: [null, 16]
+  e7_dataset: ton
+  e7_models: [symdig, multignn]
+  e7_classes: [MITM, Ransomware, Backdoor, Injection]
+  e7_strategies: [pair, reverse, flood]
+  e7_k: [0, 10, 50, 100]

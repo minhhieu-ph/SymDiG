@@ -1,0 +1,7 @@
+cache/
+results*/
+dataset/
+external/
+tests/tmp_*/
+__pycache__/
+*.pyc
